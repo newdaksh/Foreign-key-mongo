@@ -1,3 +1,19 @@
+// Recursively convert $dateFromString in query objects to JS Date objects
+function convertDateFromString(obj) {
+  if (Array.isArray(obj)) {
+    return obj.map(convertDateFromString);
+  } else if (obj && typeof obj === "object") {
+    if ("$dateFromString" in obj && obj["$dateFromString"].dateString) {
+      return new Date(obj["$dateFromString"].dateString);
+    }
+    const out = {};
+    for (const key in obj) {
+      out[key] = convertDateFromString(obj[key]);
+    }
+    return out;
+  }
+  return obj;
+}
 // server.js
 import express from "express";
 import bodyParser from "body-parser";
@@ -15,7 +31,7 @@ const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 
 const MONGO_URI = process.env.MONGO_URI || "mongodb://localhost:27017";
 const DB_NAME = process.env.DB_NAME || "mydb";
-const PORT = process.env.PORT ? Number(process.env.PORT) : 8000;
+const PORT = 8001;
 
 const app = express();
 app.use(bodyParser.json());
@@ -42,63 +58,82 @@ Important global rules:
 1. Always use the exact field names used by the collection:
    - Events collection: use "Event_date", "Event_location", "Event_type", etc.
    - Users collection: use "DOB" (date of birth) if the prompt references birthdate or age; other fields: "Name", "Gender", "Location", etc.
-   - Dating collection: use "Dating_date", "Dating_location" (if present), "Male_id", "Female_id", etc.
+   - Datings collection: use "Dating_date", "Dating_location" (if present), "Male_id", "Female_id", etc.
 
-2. Text matching: ALWAYS use case-insensitive MongoDB operators for ANY text/location searches. MANDATORY: Use "$regex" with "$options": "i" for ALL substring matches in location fields. 
+2. Text matching: ALWAYS use case-insensitive MongoDB operators for ANY text searches, including types, names, locations, etc. MANDATORY: Use "$regex" with "$options": "i" for ALL substring or partial matches in ANY text fields (e.g., Event_location, Event_type, Name, Location, etc.). NEVER use exact string matching for text fields—always partial with regex.
    Examples: 
    - { "Event_location": { "$regex": "mumbai", "$options": "i" } }
-   - { "Dating_location": { "$regex": "bengaluru", "$options": "i" } }
-   - { "Location": { "$regex": "chennai", "$options": "i" } }
+   - { "Event_type": { "$regex": "startup pitch", "$options": "i" } }
+   - { "Name": { "$regex": "john", "$options": "i" } }
 
 3. Dates and ranges (critical for all date fields like "Event_date", "Dating_date", "DOB"):
-   - Always use MongoDB's $dateFromString operator to specify any date literals in comparisons to ensure proper Date type handling. Do not use plain strings for date values.
-   - Format: { "$dateFromString": { "dateString": "YYYY-MM-DDTHH:mm:ssZ", "timezone": "UTC" } }. Omit seconds/millis if not needed, but prefer full ISO for precision.
-   - For exact day queries (e.g., "1st December 2025"): Use a range for that day: $gte start-of-day (T00:00:00Z), $lte end-of-day (T23:59:59Z), using $dateFromString for both.
+   - NEVER use $expr, $month, $year, or any aggregation operators in the query. ALWAYS use simple $gte/$lte/$gt/$lt ranges with $dateFromString for ALL date queries. This is mandatory and more reliable.
+   - Format for dates: { "$dateFromString": { "dateString": "YYYY-MM-DDTHH:mm:ssZ", "timezone": "UTC" } }
+   - For exact day queries (e.g., "1st December 2025"): Use a range for that day: $gte start-of-day, $lte end-of-day.
      Example: { "Event_date": { "$gte": { "$dateFromString": { "dateString": "2025-12-01T00:00:00Z", "timezone": "UTC" } }, "$lte": { "$dateFromString": { "dateString": "2025-12-01T23:59:59Z", "timezone": "UTC" } } } }
-   - For month+year (e.g., "December 2025"): Use a range from first to last day of the month, with $dateFromString.
+   - For month+year (e.g., "December 2025"): Use a range from first to last day of the month.
      Example: { "Event_date": { "$gte": { "$dateFromString": { "dateString": "2025-12-01T00:00:00Z", "timezone": "UTC" } }, "$lte": { "$dateFromString": { "dateString": "2025-12-31T23:59:59Z", "timezone": "UTC" } } } }
-   - For month-only (e.g., "events in October" or "born in December"): Infer year using YEAR-INFERENCE RULE (below), then use month range as above. If no specific year and searching across years, use $expr with $month (and optionally $year if bounded).
-     Example for any December: { "$expr": { "$eq": [ { "$month": { "date": "$DOB", "timezone": "UTC" } }, 12 ] } }
-   - For date-only or partial dates (e.g., "events on the 1st", "birthdays on 15th"): Infer month/year using YEAR-INFERENCE RULE and CurrentServerDate, then use $expr for day/month/year matching.
-     Example: { "$expr": { "$and": [ { "$eq": [ { "$dayOfMonth": { "date": "$Event_date", "timezone": "UTC" } }, 1 ] }, { "$eq": [ { "$month": { "date": "$Event_date", "timezone": "UTC" } }, 12 ] }, { "$eq": [ { "$year": { "date": "$Event_date", "timezone": "UTC" } }, 2025 ] } ] } }
-   - For relative expressions ("this month", "next month", "today", "tomorrow", "yesterday", "next year"): Calculate absolute dates using the provided CurrentServerDate. Use date math logically (e.g., "next month" = current month +1, handle year rollover).
+   - For month-only (e.g., "events in November"): Infer year using YEAR-INFERENCE RULE and use month range. ALWAYS treat month names as dates, not locations.
+     Example for November 2025: { "Event_date": { "$gte": { "$dateFromString": { "dateString": "2025-11-01T00:00:00Z", "timezone": "UTC" } }, "$lte": { "$dateFromString": { "dateString": "2025-11-30T23:59:59Z", "timezone": "UTC" } } } }
+   - For year-only (e.g., "events in 2025"): Use range from Jan 1 to Dec 31.
+   - For relative expressions ("this month", "next month", "last month"): Calculate absolute dates using CurrentServerDate and use $gte/$lte ranges.
+     Example: If CurrentServerDate is 2025-09-23 and prompt is "next month", use October 2025 range.
    - Apply to all date fields: "Event_date", "Dating_date", "DOB" uniformly.
+   - Handle typos in dates/months (e.g., "novemeber" -> "November", "decembre" -> "December").
 
 4. YEAR-INFERENCE RULE (when user omits the year or parts):
    - Use "CurrentServerDate" from the user message to infer:
      * If requested month >= current month → use current year.
      * If requested month < current month → use next year.
      * For days: If day in future of current month/year, use current; if past, roll to next month/year as appropriate.
+     * Example: CurrentServerDate 2025-09-23, "November" (11 > 9) → 2025-11.
+     * Example: CurrentServerDate 2025-09-23, "August" (8 < 9) → 2026-08.
    - For ambiguous partial dates (e.g., "the 1st" without month), assume current month/year, or next plausible.
    - If CurrentServerDate not provided, assume current year from a default like 2025, but prefer {} if uncertain.
 
 5. Age / DOB conversions:
    - For age (e.g., "aged 25 to 30"): Convert to DOB ranges using CurrentServerDate. Age 25 means DOB <= CurrentServerDate - 25 years, > CurrentServerDate - 26 years (for lower bound).
-     Use $gte/$lt with $dateFromString for the calculated ISO dates.
-     Example: { "DOB": { "$lte": { "$dateFromString": { "dateString": "2000-09-22T00:00:00Z" } }, "$gt": { "$dateFromString": { "dateString": "1995-09-22T00:00:00Z" } } } } (adjust dates based on calc).
-   - For "born in December" (no year): Use $expr with $month as above.
-   - For "born in December 1990": Use month range with year as above.
+     Use $gte/$lt with $dateFromString for the calculated ISO dates. Calculate precisely: for min age A, DOB <= current - A years; for max age B, DOB > current - (B+1) years.
+     Example (assume CurrentServerDate 2025-09-23): for ages 25-30, { "DOB": { "$lte": { "$dateFromString": { "dateString": "2000-09-23T00:00:00Z" } }, "$gt": { "$dateFromString": { "dateString": "1994-09-23T00:00:00Z" } } } } (adjust dates based on calc).
+   - For "born in December" (no year): Use range for December of inferred year.
+   - For "born in December 1990": Use month range with year.
 
-6. Location matching rules (CRITICAL):
-   - For location searches, ALWAYS use $regex with $options: "i" for case-insensitive partial matching
-   - Dating collection: When user searches "datings in [city]", use: { "Dating_location": { "$regex": "[city]", "$options": "i" } }
-   - Events collection: When user searches "events in [city]", use: { "Event_location": { "$regex": "[city]", "$options": "i" } }
-   - Users collection: When user searches "users in [city]", use: { "Location": { "$regex": "[city]", "$options": "i" } }
-   - NEVER use exact string matching for locations - always use regex for partial matches
+6. Location vs. Time distinction (CRITICAL):
+   - If the query contains "in [X]", determine if X is a time indicator (month, year, day, "next week", etc.) or a location (city, state, country).
+   - Month names (January-December, Jan-Dec, typos like novemeber) or numbers (2025) after "in" MUST be treated as dates, using date ranges on the appropriate date field.
+   - City/place names (e.g., Delhi, Mumbai, New York) after "in" MUST be treated as locations, using $regex on the location field.
+   - Use context: "events in November" → date (month). "events in Delhi" → location. "events in Delhi in November" → both location and date.
+   - NEVER misinterpret month names as locations—prioritize date if it matches a month.
 
-7. Tolerant parsing:
-   - Handle typos, abbreviations (e.g., "Dec", "1st", "first", "oct"), ordinals, formats (DD/MM/YYYY, MM/DD/YYYY—assume DD/MM if ambiguous, use context).
-   - For ambiguity (e.g., "March" could be past/future), use YEAR-INFERENCE; if still ambiguous, return {"__ambiguous": true, "alternatives": [ {...}, {...} ] }.
+7. Tolerant parsing and YEAR-INFERENCE:
+  - Handle typos, abbreviations (e.g., "Dec", "1st", "first", "oct", "novemeber"→November), ordinals, formats (DD/MM/YYYY, MM/DD/YYYY—assume DD/MM if ambiguous, use context).
+  - For ambiguity (e.g., "March" could be past/future), use YEAR-INFERENCE; if still ambiguous, return {"__ambiguous": true, "alternatives": [ {...}, {...} ] }.
+  - For month-only queries (e.g., "events in August"), ALWAYS use the current year from CurrentServerDate unless the user specifies a year. Do NOT use a future year unless explicitly requested.
 
-8. Output rules:
-   - Return only one JSON object (no explanation).
-   - Keys must be valid JSON strings and Mongo operators quoted (e.g., "$gte", "$expr").
-   - Use $and / $or / $expr only when needed for complex logic.
-   - Always incorporate timezone: "UTC" in $dateFromString or date functions to avoid issues.
-   - For location searches, MANDATORY: use $regex with $options: "i" - never use exact string matching.
-   - If you cannot parse the prompt, return {}.
+8. Output rules (CRITICAL):
+   - Return ONLY a valid JSON object that can be parsed by JSON.parse()
+   - Keys must be valid JSON strings quoted with double quotes
+   - MongoDB operators like "$gte", "$lte", "$dateFromString" must be quoted with double quotes
+   - Field names like "Event_date" must be quoted with double quotes
+   - NEVER use $expr—always use $gte/$lte ranges for dates
+   - Always use $dateFromString for date values, never plain strings or ISODate
+   - For ALL text searches (locations, types, etc.), MANDATORY: use $regex with $options: "i"
+   - If you cannot parse the prompt, return {}
+   - EXAMPLE of correct output: { "Event_date": { "$gte": { "$dateFromString": { "dateString": "2025-11-01T00:00:00Z", "timezone": "UTC" } }, "$lte": { "$dateFromString": { "dateString": "2025-11-30T23:59:59Z", "timezone": "UTC" } } } }
 
-End of system rules. REMEMBER: output must be strictly a valid JSON object for a MongoDB query and nothing else.
+Additional Examples (follow these patterns strictly):
+- Prompt: "events in november"
+  Output: { "Event_date": { "$gte": { "$dateFromString": { "dateString": "2025-11-01T00:00:00Z", "timezone": "UTC" } }, "$lte": { "$dateFromString": { "dateString": "2025-11-30T23:59:59Z", "timezone": "UTC" } } } }
+- Prompt: "events in mumbai"
+  Output: { "Event_location": { "$regex": "mumbai", "$options": "i" } }
+- Prompt: "startup pitch events in delhi in novemeber"
+  Output: { "Event_type": { "$regex": "startup pitch", "$options": "i" }, "Event_location": { "$regex": "delhi", "$options": "i" }, "Event_date": { "$gte": { "$dateFromString": { "dateString": "2025-11-01T00:00:00Z", "timezone": "UTC" } }, "$lte": { "$dateFromString": { "dateString": "2025-11-30T23:59:59Z", "timezone": "UTC" } } } }
+- Prompt: "users aged 25 in jaipur"
+  Output: { "DOB": { "$lte": { "$dateFromString": { "dateString": "2000-09-23T00:00:00Z" } }, "$gt": { "$dateFromString": { "dateString": "1999-09-23T00:00:00Z" } } }, "Location": { "$regex": "jaipur", "$options": "i" } }
+- Prompt: "datings in bengaluru next month"
+  Output: { "Dating_location": { "$regex": "bengaluru", "$options": "i" }, "Dating_date": { "$gte": { "$dateFromString": { "dateString": "2025-10-01T00:00:00Z", "timezone": "UTC" } }, "$lte": { "$dateFromString": { "dateString": "2025-10-31T23:59:59Z", "timezone": "UTC" } } } }
+
+End of system rules. REMEMBER: output must be strictly a valid JSON object for MongoDB query parsing.
 `;
 
 /**
@@ -138,16 +173,23 @@ Prompt: ${prompt}`;
       return {};
     }
 
-    // Try to parse raw as JSON directly (model is instructed to return only JSON)
+    // Sanitize OpenAI output: only replace field names like $Event_date, not MongoDB operators
+    let sanitized = raw
+      // Replace field names starting with $ (but not MongoDB operators)
+      .replace(
+        /\$(?!gte|lte|eq|gt|lt|ne|in|nin|and|or|not|nor|exists|type|regex|options|size|all|elemMatch|where|expr|jsonSchema|mod|text|search|language|caseSensitive|diacriticSensitive|near|nearSphere|geoWithin|geoIntersects|geometry|maxDistance|minDistance|center|centerSphere|box|polygon|uniqueDocs|inc|mul|rename|setOnInsert|set|unset|min|max|currentDate|addToSet|pop|pullAll|pull|pushAll|push|each|slice|sort|position|bit|isolated|dateFromString|month|year|dayOfMonth|date|timezone)([A-Za-z_][A-Za-z0-9_]*)/g,
+        '"$1"'
+      )
+      // Quote unquoted field names (best effort)
+      .replace(/([\{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)/g, '$1"$2"$3');
+
     try {
-      const parsed = JSON.parse(raw);
+      const parsed = JSON.parse(sanitized);
       return parsed;
     } catch (e) {
-      // If direct parsing fails, do NOT do aggressive regex fixes (per user's preference).
-      // Minimal graceful attempt: trim surrounding whitespace and try again; otherwise return {}
-      const trimmed = raw.trim();
+      // If still can't parse, try the original raw string
       try {
-        const parsed = JSON.parse(trimmed);
+        const parsed = JSON.parse(raw.trim());
         return parsed;
       } catch (e2) {
         console.error(
@@ -189,7 +231,7 @@ async function runMongoQuery(collectionName, mongoQuery, limit = 50) {
 
 /**
  * Main search endpoint used in screenshots: POST /search/debug
- * Body: { query: "Events in October", searchType: "events|users|dating", limit: 10 }
+ * Body: { query: "Events in October", limit: 10 } // searchType is optional, auto-detected
  */
 app.post("/search/debug", async (req, res) => {
   try {
@@ -206,21 +248,29 @@ app.post("/search/debug", async (req, res) => {
         .json({ error: "Missing 'query' in request body." });
     }
 
-    // Auto-detect searchType if not provided
+    // Improved auto-detect searchType if not provided
     if (!searchType) {
       const lowerPrompt = prompt.toLowerCase();
-      if (lowerPrompt.match(/event|meetup|conference|workshop|gathering/)) {
+      if (
+        lowerPrompt.match(
+          /\b(event|meetup|conference|workshop|gathering|pitch|startup|party|seminar)\b/
+        )
+      ) {
         searchType = "events";
       } else if (
         lowerPrompt.match(
-          /user|person|people|member|profile|age|gender|location|name/
+          /\b(datings|match|relationship|couple|date|romantic|pairing)\b/
+        )
+      ) {
+        searchType = "datings";
+      } else if (
+        lowerPrompt.match(
+          /\b(male|female|user|person|people|member|profile|age|gender|location|name|boy|girl|man|woman|jaipur|delhi|mumbai|bengaluru|chennai)\b/
         )
       ) {
         searchType = "users";
-      } else if (lowerPrompt.match(/dating|match|relationship|couple|date/)) {
-        searchType = "dating";
       } else {
-        searchType = "events"; // default fallback
+        searchType = "users"; // default fallback is users
       }
     }
 
@@ -228,32 +278,13 @@ app.post("/search/debug", async (req, res) => {
     const collectionMap = {
       events: "events",
       users: "users",
-      dating: "dating",
+      datings: "datings",
     };
-    const collectionName = collectionMap[searchType] || "events";
+    const collectionName = collectionMap[searchType] || "users";
 
     // Ask the model to produce a valid MongoJSON query
     let mongoQuery = await parsePromptToMongoQuery(prompt, collectionName);
-
-    // Force $options: 'i' for all $regex location fields
-    function enforceRegexOptions(obj) {
-      if (obj && typeof obj === "object") {
-        for (const key of Object.keys(obj)) {
-          if (typeof obj[key] === "object" && obj[key] !== null) {
-            // Check for $regex in location fields
-            if (
-              (key.toLowerCase().includes("location") ||
-                key.toLowerCase().includes("place")) &&
-              obj[key].$regex
-            ) {
-              obj[key].$options = "i";
-            }
-            enforceRegexOptions(obj[key]);
-          }
-        }
-      }
-    }
-    enforceRegexOptions(mongoQuery);
+    mongoQuery = convertDateFromString(mongoQuery);
 
     // If model returned an __ambiguous object, include it in the response and do not run DB query
     if (mongoQuery && mongoQuery.__ambiguous) {
@@ -307,7 +338,7 @@ app.post("/search/debug", async (req, res) => {
       }
     }
     // Enrich dating results with full user documents for Male_id and Female_id
-    if (collectionName === "dating" && results && results.length > 0) {
+    if (collectionName === "datings" && results && results.length > 0) {
       for (const doc of results) {
         try {
           if (doc.Male_id) {
@@ -390,7 +421,7 @@ async function startServer() {
   app.listen(PORT, () => {
     console.log(`Smart MCP test server running at http://localhost:${PORT}`);
     console.log(
-      'Use POST /search/debug with body { "query": "your search", "searchType": "events|users|dating" }'
+      'Use POST /search/debug with body { "query": "your search" }' // searchType optional
     );
   });
 }
