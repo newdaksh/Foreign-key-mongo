@@ -2,7 +2,7 @@
 // Single-file server that:
 // - connects to MongoDB
 // - exposes /search/users, /search/events, /search/dating (plain-English "q" parsing)
-// - optional populate=true to include user docs in events/dating
+// - populate=false to disable user population in events/dating (default: populate=true)
 //
 // Run instructions:
 // 1) npm init -y
@@ -23,7 +23,7 @@
 // Headers: Authorization: Bearer <API_KEY>, Content-Type: application/json
 // Body: {"q":"female UX Designers in Bengaluru older than 25", "limit": 10}
 //
-// GET /search/events?populate=true  (body: {"q":"Tech Meetup Bengaluru", "limit":5})
+// GET /search/events?populate=false  (body: {"q":"Tech Meetup Bengaluru", "limit":5}) - set populate=false to disable user population
 
 import express from "express";
 import OpenAI from "openai";
@@ -54,11 +54,138 @@ const openai = OPENAI_API_KEY ? new OpenAI({ apiKey: OPENAI_API_KEY }) : null;
 const SYSTEM_PROMPT = `
 SYSTEM ROLE: You are an assistant whose only job is to convert a user's natural-language search prompt into a single valid JSON object that is a MongoDB query for a specific collection. RETURN ONLY A JSON OBJECT (no explanation, no extra text, no code fences). The output MUST be a syntactically valid JSON object that MongoDB accepts when parsed.
 
+CRITICAL FOREIGN KEY QUERY DETECTION (HIGHEST PRIORITY - OVERRIDES ALL OTHER RULES):
+
+When CollectionHint is "users" and the prompt contains patterns indicating foreign key relationships, you MUST return a special foreign key query format:
+
+1. **Foreign Key Event Patterns (users related to events):**
+   - "users which go to [event criteria]"
+   - "users which go in [event criteria]"
+   - "users attending [event criteria]" 
+   - "users participating in [event criteria]"
+   - "users who attend [event criteria]"
+   - "users going to [event criteria]"
+   
+   For these patterns, return: { "__foreign_key_query": "events", "__criteria": { [event filter based on criteria] } }
+   
+   Examples:
+   - "give me users which go in Design Workshop events" → { "__foreign_key_query": "events", "__criteria": { "Event_type": { "$regex": "Design Workshop", "$options": "i" } } }
+   - "users attending tech meetup" → { "__foreign_key_query": "events", "__criteria": { "Event_type": { "$regex": "tech meetup", "$options": "i" } } }
+   - "users going to events in mumbai" → { "__foreign_key_query": "events", "__criteria": { "Event_location": { "$regex": "mumbai", "$options": "i" } } }
+
+2. **Foreign Key Dating Patterns (users related to dating):**
+   - "users which go to date in [location]"
+   - "users which go in date in [location]" 
+   - "users dating in [location]"
+   - "users who date in [location]"
+   - "users in dating [criteria]"
+   
+   For these patterns, return: { "__foreign_key_query": "dating", "__criteria": { [dating filter based on criteria] } }
+   
+   Examples:
+   - "give me users which go to date in mumbai" → { "__foreign_key_query": "dating", "__criteria": { "Dating_location": { "$regex": "mumbai", "$options": "i" } } }
+   - "users dating in december" → { "__foreign_key_query": "dating", "__criteria": { "Dating_Date": { "$gte": { "$dateFromString": { "dateString": "2025-12-01T00:00:00Z", "timezone": "UTC" } }, "$lte": { "$dateFromString": { "dateString": "2025-12-31T23:59:59Z", "timezone": "UTC" } } } } }
+
+3. **IMPORTANT:** Only use foreign key query format when:
+   - CollectionHint is "users" AND
+   - The prompt clearly indicates finding users based on their participation in events or dating activities
+   - Regular user queries should still use normal user collection fields
+
+
+// ✅ FIXED: Refined the "all" query logic to correctly handle additional filters like location.
+CRITICAL CROSS-COLLECTION & "ALL" QUERY LOGIC (HIGHEST PRIORITY - OVERRIDES EVERYTHING):
+
+1.  **Cross-Collection Filtering:** When a user's prompt is CLEARLY about a specific collection, you MUST generate a "no-results query" for the OTHER collection hints. A "no-results query" is a query that is guaranteed to find zero documents.
+    * Use this exact format for a no-results query: \`{ "_id": "intentionally_no_match" }\`
+    * If the prompt is about "users" (e.g., "all users", "male software engineers"):
+        * For CollectionHint "events", you MUST return \`{ "_id": "intentionally_no_match" }\`.
+        * For CollectionHint "dating", you MUST return \`{ "_id": "intentionally_no_match" }\`.
+    * If the prompt is about "events" (e.g., "events in November", "tech meetups"):
+        * For CollectionHint "users", you MUST return \`{ "_id": "intentionally_no_match" }\`.
+        * For CollectionHint "dating", you MUST return \`{ "_id": "intentionally_no_match" }\`.
+    * If the prompt is about "dating" (e.g., "datings in June", "dates in London"):
+        * For CollectionHint "users", you MUST return \`{ "_id": "intentionally_no_match" }\`.
+        * For CollectionHint "events", you MUST return \`{ "_id": "intentionally_no_match" }\`.
+
+2.  **"All" Queries & Filter Combination:** This rule defines how to handle prompts containing words like "all", "every", "give me all".
+    * **If the prompt ONLY asks for all documents without other filters**, return an empty object \`{}\`.
+        * Example Prompt: "all users" AND \`CollectionHint\` is "users" → \`{}\`
+        * Example Prompt: "show me all events" AND \`CollectionHint\` is "events" → \`{}\`
+    * **If the prompt asks for "all" documents BUT also includes other filters** (like location, date, gender, etc.), you MUST generate a query that includes those filters. DO NOT return an empty object \`{}\`.
+        * Example Prompt: "all users in jaipur" AND \`CollectionHint\` is "users" → \`{ "Location": { "$regex": "jaipur", "$options": "i" } }\`
+        * Example Prompt: "all male users" AND \`CollectionHint\` is "users" → \`{ "Gender": { "$regex": "^male$", "$options": "i" } }\`
+        * Example Prompt: "give me all events in november" AND \`CollectionHint\` is "events" → (Generate a date range query for November)
+
+This logic is critical. A query like "all users in jaipur" MUST be filtered by location and not return all users.
+
+CRITICAL RULES FOR COLLECTION HINTS:
+- CollectionHint "events" → Query for "events" collection using "Event_date", "Event_location", "Event_type" fields
+- CollectionHint "dating" → Query for "datings" collection using "Dating_Date", "Dating_location", "Male_id", "Female_id" fields
+- CollectionHint "users" → Query for "users" collection using "Name", "Gender", "Location", "DOB", "Salary", "Occupation", "email" fields
+
 
 CRITICAL RULES FOR COLLECTION HINTS:
 - CollectionHint "events" → Query for "events" collection using "Event_date", "Event_location", "Event_type" fields
 - CollectionHint "dating" → Query for "datings" collection using "Dating_Date", "Dating_location", "Male_id", "Female_id" fields  
 - CollectionHint "users" → Query for "users" collection using "Name", "Gender", "Location", "DOB", "Salary", "Occupation", "email" fields
+
+
+CRITICAL "ALL" QUERY RULES (HIGHEST PRIORITY):
+When users ask for ALL records without specific filters, return an empty object {} to match all documents:
+- "give me all users" → {}
+- "show all users" → {}
+- "list all users" → {}
+- "get all users" → {}
+- "all users" → {}
+- "give all events" → {}
+- "show all events" → {}
+- "list all events" → {}
+- "get all events" → {}
+- "all events" → {}
+- "give all datings" → {}
+- "show all datings" → {}
+- "list all datings" → {}
+- "get all datings" → {}
+- "all datings" → {}
+- Any variation of "give/show/list/get/display all [collection_name]" → {} → of that particular collection only
+
+// ✅ ADD THIS NEW BLOCK
+CRITICAL CROSS-COLLECTION LOGIC (SUPERSEDES ALL OTHER RULES):
+When a user's prompt is CLEARLY about a specific collection, you MUST generate a "no-results query" for the OTHER collection hints. A "no-results query" is a query that is guaranteed to find zero documents.
+- Use this exact format for a no-results query: { "_id": "intentionally_no_match" }
+
+- If the prompt is about "users" (e.g., "all users", "male software engineers"):
+  - For CollectionHint "events", you MUST return { "_id": "intentionally_no_match" }.
+  - For CollectionHint "dating", you MUST return { "_id": "intentionally_no_match" }.
+
+- If the prompt is about "events" (e.g., "events in November", "tech meetups"):
+  - For CollectionHint "users", you MUST return { "_id": "intentionally_no_match" }.
+  - For CollectionHint "dating", you MUST return { "_id": "intentionally_no_match" }.
+
+- If the prompt is about "dating" (e.g., "datings in June", "dates in London"):
+  - For CollectionHint "users", you MUST return { "_id": "intentionally_no_match" }.
+  - For CollectionHint "events", you MUST return { "_id": "intentionally_no_match" }.
+
+This rule is critical to prevent irrelevant collections from returning all their documents. For example, for the prompt "all users", the filter for "events" must be { "_id": "intentionally_no_match" }, NOT {}.
+
+CRITICAL RULES FOR COLLECTION HINTS:
+- CollectionHint "events" → Query for "events" collection using "Event_date", "Event_location", "Event_type" fields
+- CollectionHint "dating" → Query for "datings" collection using "Dating_Date", "Dating_location", "Male_id", "Female_id" fields  
+- CollectionHint "users" → Query for "users" collection using "Name", "Gender", "Location", "DOB", "Salary", "Occupation", "email" fields
+
+MANDATORY: When CollectionHint is "users", ALWAYS use the correct field names for users collection:
+- Location searches → use "Location" field (NOT "Event_location" or "Dating_location")
+- Gender searches → use "Gender" field  
+- Date of birth → use "DOB" field
+- Salary searches → use "Salary" field with numeric comparisons
+- Name searches → use "Name" field
+- Occupation searches → use "Occupation" field
+
+CRITICAL USER COLLECTION EXAMPLES:
+- CollectionHint "users", Prompt "male in jaipur" → { "Gender": { "$regex": "^male$", "$options": "i" }, "Location": { "$regex": "jaipur", "$options": "i" } }
+- CollectionHint "users", Prompt "female with salary above 500000" → { "Gender": { "$regex": "^female$", "$options": "i" }, "Salary": { "$gte": 500000 } }
+- CollectionHint "users", Prompt "users in bangalore with salary 600000" → { "Location": { "$regex": "bangalore", "$options": "i" }, "Salary": 600000 }
+- CollectionHint "users", Prompt "male software engineer" → { "Gender": { "$regex": "^male$", "$options": "i" }, "Occupation": { "$regex": "software engineer", "$options": "i" } }
 
 MANDATORY DATE HANDLING (applies to ALL collections):
 - NEVER use $expr, $month, $year - ALWAYS use $gte/$lte ranges with $dateFromString
@@ -91,8 +218,6 @@ DATING COLLECTION RULES (HIGHEST PRIORITY):
   * "datings in June" → { "Dating_Date": { "$gte": { "$dateFromString": { "dateString": "2025-06-01T00:00:00Z", "timezone": "UTC" } }, "$lte": { "$dateFromString": { "dateString": "2025-06-30T23:59:59Z", "timezone": "UTC" } } } }
   * "datings in Dec 2025" → { "Dating_Date": { "$gte": { "$dateFromString": { "dateString": "2025-12-01T00:00:00Z", "timezone": "UTC" } }, "$lte": { "$dateFromString": { "dateString": "2025-12-31T23:59:59Z", "timezone": "UTC" } } } }
 
-Important: If the user's query is clearly about events or dating (not users), then for the users collection, return an empty query object {} (not a filter for all users). This ensures that the users search does not return all users when the query is not about users. For example, if the prompt is "Startup Pitch events in November", the users query should be {}.
-
 CRITICAL DATING COLLECTION RULES:
 - CollectionHint "dating" means you are generating a query for the "datings" collection.
 - When CollectionHint is "dating" and the prompt contains month names (June, Dec, December, etc.), you MUST generate a date range query on the "Dating_Date" field.
@@ -104,10 +229,16 @@ CRITICAL DATING COLLECTION RULES:
 - Example: "datings in June" MUST produce: { "Dating_Date": { "$gte": { "$dateFromString": { "dateString": "2025-06-01T00:00:00Z", "timezone": "UTC" } }, "$lte": { "$dateFromString": { "dateString": "2025-06-30T23:59:59Z", "timezone": "UTC" } } } }
 
 Important global rules:
+
 1. Always use the exact field names used by the collection:
-   - Events collection: use "Event_date", "Event_location", "Event_type", etc.
-   - Users collection: use "DOB" (date of birth) if the prompt references birthdate or age; other fields: "Name", "Gender", "Location", etc.
-   - Datings collection: use "Dating_Date", "Dating_location" (if present), "Male_id", "Female_id", etc.
+  - Events collection: use "Event_date", "Event_location", "Event_type", etc.
+  - Users collection: use "DOB" (date of birth) if the prompt references birthdate or age; other fields: "Name", "Gender", "Location", "Salary", "Occupation", "email", etc.
+  - For salary-based queries in users collection, use MongoDB comparison operators:
+    * "male with 600000 salary" → { "Gender": { "$regex": "^male$", "$options": "i" }, "Salary": 600000 }
+    * "users with salary above 500000" → { "Salary": { "$gte": 500000 } }
+    * "users with salary below 700000" → { "Salary": { "$lte": 700000 } }
+    * "users with salary between 500000 and 700000" → { "Salary": { "$gte": 500000, "$lte": 700000 } }
+  - Datings collection: use "Dating_Date", "Dating_location" (if present), "Male_id", "Female_id", etc.
 
 2. Text matching: ALWAYS use case-insensitive MongoDB operators for ANY text searches, including types, names, locations, etc. MANDATORY: Use "$regex" with "$options": "i" for ALL substring or partial matches in ANY text fields (e.g., Event_location, Event_type, Name, Location, etc.). NEVER use exact string matching for text fields—always partial with regex.
 
@@ -197,6 +328,39 @@ Additional Examples (follow these patterns strictly):
 - Prompt: "datings in bengaluru next month"
   Output: { "Dating_location": { "$regex": "bengaluru", "$options": "i" }, "Dating_Date": { "$gte": { "$dateFromString": { "dateString": "2025-10-01T00:00:00Z", "timezone": "UTC" } }, "$lte": { "$dateFromString": { "dateString": "2025-10-31T23:59:59Z", "timezone": "UTC" } } } }
 
+CRITICAL "ALL" QUERY EXAMPLES (MANDATORY PATTERNS):
+- Prompt: "give me all users"
+  Output: {}
+- Prompt: "show all users"
+  Output: {}
+- Prompt: "list all users"
+  Output: {}
+- Prompt: "all users"
+  Output: {}
+- Prompt: "give all events"
+  Output: {}
+- Prompt: "show all events"
+  Output: {}
+- Prompt: "all events"
+  Output: {}
+- Prompt: "give all datings"
+  Output: {}
+- Prompt: "show all datings"
+  Output: {}
+- Prompt: "all datings"
+  Output: {}
+- Prompt: "give me all the users"
+  Output: {}
+- Prompt: "display all events"
+  Output: {}
+- Prompt: "get all datings"
+  Output: {}
+
+ADDITIONAL CROSS-COLLECTION EXAMPLE (FOLLOW STRICTLY):
+- Prompt: "all users"
+  - CollectionHint: "users"  → {}
+  - CollectionHint: "events" → { "_id": "intentionally_no_match" }
+  - CollectionHint: "dating" → { "_id": "intentionally_no_match" }
 `;
 
 // ----- simple API key middleware -----
@@ -232,15 +396,106 @@ function convertDateFromString(obj) {
 }
 function hideSensitive(doc) {
   if (!ALLOW_PII) {
-    const { Salary, email, ...rest } = doc;
+    const { email, ...rest } = doc;
     return rest;
   }
   return doc;
 }
 
 // ----- Dynamic prompt-to-query parser -----
+// index.js
+
+// ----- Foreign Key Query Processor -----
+async function processForeignKeyQuery(foreignKeyQuery, criteria, limit = 10) {
+  try {
+    const l = Math.min(Number(limit) || 10, 100);
+
+    if (foreignKeyQuery === "events") {
+      // Find matching events first
+      const convertedCriteria = convertDateFromString(criteria);
+      const events = await db
+        .collection("events")
+        .find(convertedCriteria)
+        .toArray();
+
+      if (events.length === 0) {
+        return { count: 0, results: [] };
+      }
+
+      // Extract all participant_ids from matching events
+      const userIds = Array.from(
+        new Set(
+          events.flatMap((event) =>
+            (event.participant_ids || []).map((id) => id.toString())
+          )
+        )
+      ).map((s) => new ObjectId(s));
+
+      if (userIds.length === 0) {
+        return { count: 0, results: [] };
+      }
+
+      // Find users by IDs
+      const projection = ALLOW_PII ? {} : { email: 0 };
+      const users = await db
+        .collection("users")
+        .find({ _id: { $in: userIds } }, { projection })
+        .limit(l)
+        .toArray();
+
+      const safe = users.map(hideSensitive);
+      return { count: safe.length, results: safe };
+    } else if (foreignKeyQuery === "dating") {
+      // Find matching dating records first
+      const convertedCriteria = convertDateFromString(criteria);
+      const datings = await db
+        .collection("datings")
+        .find(convertedCriteria)
+        .toArray();
+
+      if (datings.length === 0) {
+        return { count: 0, results: [] };
+      }
+
+      // Extract all Male_id and Female_id from matching dating records
+      const userIds = Array.from(
+        new Set(
+          datings.flatMap((dating) =>
+            [dating.Male_id, dating.Female_id]
+              .filter(Boolean)
+              .map((id) => id.toString())
+          )
+        )
+      ).map((s) => new ObjectId(s));
+
+      if (userIds.length === 0) {
+        return { count: 0, results: [] };
+      }
+
+      // Find users by IDs
+      const projection = ALLOW_PII ? {} : { email: 0 };
+      const users = await db
+        .collection("users")
+        .find({ _id: { $in: userIds } }, { projection })
+        .limit(l)
+        .toArray();
+
+      const safe = users.map(hideSensitive);
+      return { count: safe.length, results: safe };
+    }
+
+    // Unknown foreign key query type
+    return { count: 0, results: [] };
+  } catch (err) {
+    console.error("Foreign key query processing error:", err);
+    return { count: 0, results: [] };
+  }
+}
+
+// ----- Dynamic prompt-to-query parser -----
 async function parsePromptToMongoQuery(prompt, type) {
-  if (!openai || !prompt) return {};
+  if (!openai || !prompt)
+    return { _id: "intentionally_no_match_on_empty_prompt" }; // Return no-match for empty prompt
   const currentServerDate = new Date().toISOString();
   const systemMsg = SYSTEM_PROMPT;
   const userMsg = `CurrentServerDate: ${currentServerDate}
@@ -263,6 +518,13 @@ Prompt: ${prompt}`;
     );
 
     try {
+      // ✅ FIXED: Handle empty response from AI
+      if (!text) {
+        console.log(
+          `[DEBUG] AI returned empty response for ${type}, returning no-match query.`
+        );
+        return { _id: "intentionally_no_match_on_empty_response" };
+      }
       const parsed = JSON.parse(text);
       console.log(
         `[DEBUG] Parsed query for ${type}:`,
@@ -271,13 +533,15 @@ Prompt: ${prompt}`;
       return parsed;
     } catch {
       console.log(
-        `[DEBUG] Failed to parse query for ${type}, returning empty object`
+        `[DEBUG] Failed to parse query for ${type}, returning no-match query`
       );
-      return {};
+      // ✅ FIXED: Return a query that finds no documents on JSON parse error
+      return { _id: "intentionally_no_match_on_parse_error" };
     }
   } catch (err) {
     console.error("NLP parse error:", err);
-    return {};
+    // ✅ FIXED: Return a query that finds no documents on API error
+    return { _id: "intentionally_no_match_on_api_error" };
   }
 }
 
@@ -301,12 +565,31 @@ async function startServer() {
 
   // SEARCH USERS: body { q: string, limit?: number }
   app.post("/search/users", async (req, res) => {
+    console.log("[DEBUG] /search/users endpoint called with body:", req.body);
     try {
       const { q = "", limit = 10 } = req.body || {};
       const l = Math.min(Number(limit) || 10, 100);
       let filter = await parsePromptToMongoQuery(q, "users");
+
+      console.log("[DEBUG] Filter generated:", JSON.stringify(filter, null, 2));
+
+      // Check if this is a foreign key query
+      if (filter && filter.__foreign_key_query && filter.__criteria) {
+        console.log(
+          `[DEBUG] Processing foreign key query for ${filter.__foreign_key_query} with criteria:`,
+          filter.__criteria
+        );
+        const result = await processForeignKeyQuery(
+          filter.__foreign_key_query,
+          filter.__criteria,
+          l
+        );
+        return res.json(result);
+      }
+
+      // Regular user query processing
       filter = convertDateFromString(filter);
-      const projection = ALLOW_PII ? {} : { Salary: 0, email: 0 };
+      const projection = ALLOW_PII ? {} : { email: 0 }; // Keep salary field visible
       const results = await db
         .collection("users")
         .find(filter, { projection })
@@ -320,11 +603,11 @@ async function startServer() {
     }
   });
 
-  // SEARCH EVENTS: body { q: string, limit?: number }, query param populate=true to populate participant docs
+  // SEARCH EVENTS: body { q: string, limit?: number }, query param populate=false to disable user population (default: true)
   app.post("/search/events", async (req, res) => {
     try {
       const { q = "", limit = 10 } = req.body || {};
-      const populate = req.query.populate === 'true';
+      const populate = req.query.populate !== "false"; // Default to true, only disable if explicitly set to false
       const l = Math.min(Number(limit) || 10, 100);
       const baseFilter = await parsePromptToMongoQuery(q, "events");
       const filter = convertDateFromString(baseFilter);
@@ -343,7 +626,7 @@ async function startServer() {
           .collection("users")
           .find(
             { _id: { $in: userIds } },
-            { projection: ALLOW_PII ? {} : { Salary: 0, email: 0 } }
+            { projection: ALLOW_PII ? {} : { email: 0 } }
           )
           .toArray();
         const usersById = new Map(
@@ -364,20 +647,16 @@ async function startServer() {
     }
   });
 
-  // SEARCH DATING: body { q: string, limit?: number }, query param populate=true to populate Male/Female user docs
+  // SEARCH DATING: body { q: string, limit?: number }, query param populate=false to disable user population (default: true)
   app.post("/search/dating", async (req, res) => {
     try {
       const { q = "", limit = 10 } = req.body || {};
-      const populate = req.query.populate === 'true';
+      const populate = req.query.populate !== "false"; // Default to true, only disable if explicitly set to false
       const l = Math.min(Number(limit) || 10, 100);
       const baseFilter = await parsePromptToMongoQuery(q, "dating");
       const filter = convertDateFromString(baseFilter);
 
-      let docs = await db
-        .collection("datings")
-        .find(filter)
-        .limit(l)
-        .toArray();
+      let docs = await db.collection("datings").find(filter).limit(l).toArray();
 
       if (populate && docs.length) {
         const userIds = Array.from(
@@ -393,7 +672,7 @@ async function startServer() {
           .collection("users")
           .find(
             { _id: { $in: userIds } },
-            { projection: ALLOW_PII ? {} : { Salary: 0, email: 0 } }
+            { projection: ALLOW_PII ? {} : { email: 0 } }
           )
           .toArray();
         const usersById = new Map(
@@ -417,7 +696,7 @@ async function startServer() {
   app.post("/search/all", async (req, res) => {
     try {
       const { q = "", limit = 10 } = req.body || {};
-      const populate = req.query.populate === 'true';
+      const populate = req.query.populate !== "false"; // Default to true, only disable if explicitly set to false
       const l = Math.min(Number(limit) || 10, 30); // Reduced per-collection limit for combined search
 
       // Search all three collections in parallel
@@ -427,13 +706,35 @@ async function startServer() {
         parsePromptToMongoQuery(q, "dating"),
       ]);
 
+      console.log(`[DEBUG] Filters generated:`, {
+        usersFilter,
+        eventsFilter,
+        datingFilter,
+      });
+
       // Only run queries if the filter is not empty
       let usersResults = [];
-      if (usersFilter && Object.keys(usersFilter).length > 0) {
+      // Check if this is a foreign key query for users
+      if (
+        usersFilter &&
+        usersFilter.__foreign_key_query &&
+        usersFilter.__criteria
+      ) {
+        console.log(
+          `[DEBUG] Processing foreign key query in /search/all for ${usersFilter.__foreign_key_query}`
+        );
+        const fkResult = await processForeignKeyQuery(
+          usersFilter.__foreign_key_query,
+          usersFilter.__criteria,
+          l
+        );
+        usersResults = fkResult.results || [];
+      } else if (usersFilter) {
+        // ✅ CORRECTED: This now allows an empty filter {} to pass, which finds all users.
         usersResults = await db
           .collection("users")
           .find(convertDateFromString(usersFilter), {
-            projection: ALLOW_PII ? {} : { Salary: 0, email: 0 },
+            projection: ALLOW_PII ? {} : { email: 0 }, // Keep salary visible
           })
           .limit(l)
           .toArray();
@@ -441,7 +742,8 @@ async function startServer() {
       }
 
       let eventsResults = [];
-      if (eventsFilter && Object.keys(eventsFilter).length > 0) {
+      // ✅ CORRECTED: This now allows an empty filter {} to pass, which finds all events.
+      if (eventsFilter) {
         eventsResults = await db
           .collection("events")
           .find(convertDateFromString(eventsFilter))
@@ -450,7 +752,8 @@ async function startServer() {
       }
 
       let datingResults = [];
-      if (datingFilter && Object.keys(datingFilter).length > 0) {
+      // ✅ CORRECTED: This now allows an empty filter {} to pass, which finds all datings.
+      if (datingFilter) {
         datingResults = await db
           .collection("datings")
           .find(convertDateFromString(datingFilter))
@@ -475,7 +778,7 @@ async function startServer() {
               .collection("users")
               .find(
                 { _id: { $in: eventUserIds } },
-                { projection: ALLOW_PII ? {} : { Salary: 0, email: 0 } }
+                { projection: ALLOW_PII ? {} : { email: 0 } }
               )
               .toArray();
             const eventUsersById = new Map(
@@ -508,7 +811,7 @@ async function startServer() {
               .collection("users")
               .find(
                 { _id: { $in: datingUserIds } },
-                { projection: ALLOW_PII ? {} : { Salary: 0, email: 0 } }
+                { projection: ALLOW_PII ? {} : { email: 0 } }
               )
               .toArray();
             const datingUsersById = new Map(
@@ -683,7 +986,7 @@ function setupMCPServer() {
           const l = Math.min(Number(limit) || 10, 100);
           let filter = await parsePromptToMongoQuery(query, "users");
           filter = convertDateFromString(filter);
-          const projection = ALLOW_PII ? {} : { Salary: 0, email: 0 };
+          const projection = ALLOW_PII ? {} : { email: 0 }; // Keep salary visible
           const results = await db
             .collection("users")
             .find(filter, { projection })
@@ -728,7 +1031,7 @@ function setupMCPServer() {
                   .collection("users")
                   .find(
                     { _id: { $in: userIds } },
-                    { projection: ALLOW_PII ? {} : { Salary: 0, email: 0 } }
+                    { projection: ALLOW_PII ? {} : { email: 0 } }
                   )
                   .toArray();
                 event.participantDetails = users;
@@ -777,7 +1080,7 @@ function setupMCPServer() {
                   .collection("users")
                   .findOne(
                     { _id: maleId },
-                    { projection: ALLOW_PII ? {} : { Salary: 0, email: 0 } }
+                    { projection: ALLOW_PII ? {} : { email: 0 } }
                   );
                 profile.maleDetails = male;
               }
@@ -790,7 +1093,7 @@ function setupMCPServer() {
                   .collection("users")
                   .findOne(
                     { _id: femaleId },
-                    { projection: ALLOW_PII ? {} : { Salary: 0, email: 0 } }
+                    { projection: ALLOW_PII ? {} : { email: 0 } }
                   );
                 profile.femaleDetails = female;
               }
@@ -832,7 +1135,7 @@ function setupMCPServer() {
               db
                 .collection("users")
                 .find(convertDateFromString(usersFilter), {
-                  projection: ALLOW_PII ? {} : { Salary: 0, email: 0 },
+                  projection: ALLOW_PII ? {} : { email: 0 },
                 })
                 .limit(l)
                 .toArray(),
@@ -862,7 +1165,7 @@ function setupMCPServer() {
                   .collection("users")
                   .find(
                     { _id: { $in: userIds } },
-                    { projection: ALLOW_PII ? {} : { Salary: 0, email: 0 } }
+                    { projection: ALLOW_PII ? {} : { email: 0 } }
                   )
                   .toArray();
                 event.participantDetails = users;
@@ -879,7 +1182,7 @@ function setupMCPServer() {
                         ? new ObjectId(profile.Male_id)
                         : profile.Male_id,
                   },
-                  { projection: ALLOW_PII ? {} : { Salary: 0, email: 0 } }
+                  { projection: ALLOW_PII ? {} : { email: 0 } }
                 );
                 profile.maleDetails = male;
               }
@@ -891,7 +1194,7 @@ function setupMCPServer() {
                         ? new ObjectId(profile.Female_id)
                         : profile.Female_id,
                   },
-                  { projection: ALLOW_PII ? {} : { Salary: 0, email: 0 } }
+                  { projection: ALLOW_PII ? {} : { email: 0 } }
                 );
                 profile.femaleDetails = female;
               }
