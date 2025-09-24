@@ -90,6 +90,14 @@ When CollectionHint is "users" and the prompt contains patterns indicating forei
    - CollectionHint is "users" AND
    - The prompt clearly indicates finding users based on their participation in events or dating activities
    - Regular user queries should still use normal user collection fields
+   - DO NOT use foreign key format for simple user attribute queries like "female users", "male users", "users in location", etc.
+   
+4. **Regular User Queries (NON-foreign key):**
+   These should use normal user collection fields and NOT the foreign key format:
+   - "female users only" → { "Gender": { "$regex": "^female$", "$options": "i" } }
+   - "male users" → { "Gender": { "$regex": "^male$", "$options": "i" } }
+   - "users in mumbai" → { "Location": { "$regex": "mumbai", "$options": "i" } }
+   - "software engineers" → { "Occupation": { "$regex": "software engineer", "$options": "i" } }
 
 
 // ✅ FIXED: Refined the "all" query logic to correctly handle additional filters like location.
@@ -348,6 +356,19 @@ CRITICAL "ALL" QUERY EXAMPLES (MANDATORY PATTERNS):
 - Prompt: "show all datings"
   Output: {}
 - Prompt: "all datings"
+  Output: {}
+
+CRITICAL SIMPLE USER QUERY EXAMPLES (NEVER USE FOREIGN KEY FORMAT):
+- Prompt: "give me female users only"
+  Output: { "Gender": { "$regex": "^female$", "$options": "i" } }
+- Prompt: "female users only"
+  Output: { "Gender": { "$regex": "^female$", "$options": "i" } }
+- Prompt: "male users"
+  Output: { "Gender": { "$regex": "^male$", "$options": "i" } }
+- Prompt: "users in mumbai"
+  Output: { "Location": { "$regex": "mumbai", "$options": "i" } }
+- Prompt: "software engineers"
+  Output: { "Occupation": { "$regex": "software engineer", "$options": "i" } }
   Output: {}
 - Prompt: "give me all the users"
   Output: {}
